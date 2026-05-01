@@ -6,7 +6,9 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 
-contract SavingCore is ERC721, AccessControl, Pausable {
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract SavingCore is ERC721, AccessControl, Pausable, ReentrancyGuard {
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
 
     function supportsInterface(bytes4 interfaceId) public view override(ERC721, AccessControl) returns (bool) {
@@ -26,22 +28,22 @@ contract SavingCore is ERC721, AccessControl, Pausable {
     }
 
     struct DepositPosition {
-        address owner;
         uint256 principal;
         uint256 planId;
         uint256 startTime;
         uint256 maturityAt;
-        uint256 unlockTime;
         uint256 aprSnapshot;
+        uint256 aprFloor;
         uint256 penaltySnapshot;
+        uint256 renewCount;
         bool active;
-        bool withdrawn;
     }
 
     IERC20 public token;
     address public vaultManager;
     uint256 public nextPlanId = 1;
     uint256 public nextTokenId = 1;
+    bool public autoRenewEnabled = true;
 
     mapping(uint256 => SavingsPlan) public plans;
     mapping(uint256 => DepositPosition) public positions;
@@ -54,6 +56,8 @@ contract SavingCore is ERC721, AccessControl, Pausable {
     event DepositOpened(address indexed user, uint256 indexed tokenId, uint256 amount, uint256 planId, uint256 maturityAt);
     event WithdrawAtMaturity(address indexed user, uint256 indexed tokenId, uint256 principal, uint256 interest);
     event EarlyWithdraw(address indexed user, uint256 indexed tokenId, uint256 principal, uint256 penalty);
+    event AutoRenewed(address indexed user, uint256 indexed tokenId, uint256 newApr, uint256 newMaturityAt, uint256 renewCount);
+    event ManualRenewed(address indexed user, uint256 indexed tokenId, uint256 newPlanId, uint256 newApr, uint256 newMaturityAt, uint256 bonus);
 
     constructor(address _token, address _vaultManager) ERC721("SavingCertificate", "SAVC") {
         require(_token != address(0), "Invalid token address");
@@ -128,8 +132,18 @@ contract SavingCore is ERC721, AccessControl, Pausable {
         _unpause();
     }
 
-    function openDeposit(uint256 planId, uint256 amount) external whenNotPaused returns (uint256 tokenId) {
+    function setVaultManager(address _vaultManager) external onlyRole(ADMIN_ROLE) {
+        require(_vaultManager != address(0), "Invalid vaultManager address");
+        vaultManager = _vaultManager;
+    }
+
+    function setAutoRenew(bool enabled) external onlyRole(ADMIN_ROLE) {
+        autoRenewEnabled = enabled;
+    }
+
+    function openDeposit(uint256 planId, uint256 amount) external whenNotPaused nonReentrant returns (uint256 tokenId) {
         require(amount > 0, "Amount must be > 0");
+        require(planId > 0 && planId < nextPlanId, "Plan does not exist");
 
         SavingsPlan memory plan = plans[planId];
         require(plan.enabled, "Plan not enabled");
@@ -142,21 +156,22 @@ contract SavingCore is ERC721, AccessControl, Pausable {
         }
 
         require(token.transferFrom(msg.sender, vaultManager, amount), "Transfer to vault failed");
+        IVaultManager(vaultManager).receiveDeposit(amount);
 
         tokenId = nextTokenId++;
         uint256 maturityAt = block.timestamp + plan.tenorDays * 86400;
+        uint256 aprFloor = plan.aprBps * 50 / 10000;
 
         positions[tokenId] = DepositPosition({
-            owner: msg.sender,
             principal: amount,
             planId: planId,
             startTime: block.timestamp,
             maturityAt: maturityAt,
-            unlockTime: maturityAt,
             aprSnapshot: plan.aprBps,
+            aprFloor: aprFloor,
             penaltySnapshot: plan.earlyWithdrawPenaltyBps,
-            active: true,
-            withdrawn: false
+            renewCount: 0,
+            active: true
         });
 
         _mint(msg.sender, tokenId);
@@ -164,19 +179,16 @@ contract SavingCore is ERC721, AccessControl, Pausable {
         emit DepositOpened(msg.sender, tokenId, amount, planId, maturityAt);
     }
 
-    function withdrawAtMaturity(uint256 tokenId) external whenNotPaused {
+    function withdrawAtMaturity(uint256 tokenId) external whenNotPaused nonReentrant {
         DepositPosition storage position = positions[tokenId];
         
-        require(position.owner == msg.sender, "Not owner");
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
         require(position.active, "Position not active");
-        require(!position.withdrawn, "Already withdrawn");
         require(block.timestamp >= position.maturityAt, "Not yet matured");
 
         position.active = false;
-        position.withdrawn = true;
 
         uint256 interest = calculateInterest(position.principal, position.aprSnapshot, position.maturityAt - position.startTime);
-        uint256 totalAmount = position.principal + interest;
 
         IVaultManager(vaultManager).withdrawToUser(msg.sender, position.principal, interest);
 
@@ -184,16 +196,14 @@ contract SavingCore is ERC721, AccessControl, Pausable {
         emit WithdrawAtMaturity(msg.sender, tokenId, position.principal, interest);
     }
 
-    function earlyWithdraw(uint256 tokenId) external whenNotPaused {
+    function earlyWithdraw(uint256 tokenId) external whenNotPaused nonReentrant {
         DepositPosition storage position = positions[tokenId];
         
-        require(position.owner == msg.sender, "Not owner");
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
         require(position.active, "Position not active");
-        require(!position.withdrawn, "Already withdrawn");
         require(block.timestamp < position.maturityAt, "Use withdrawAtMaturity");
 
         position.active = false;
-        position.withdrawn = true;
 
         uint256 penalty = (position.principal * position.penaltySnapshot) / BPS_DIVISOR;
         uint256 userReceives = position.principal - penalty;
@@ -205,42 +215,90 @@ contract SavingCore is ERC721, AccessControl, Pausable {
         emit EarlyWithdraw(msg.sender, tokenId, userReceives, penalty);
     }
 
-    function transferFrom(address from, address to, uint256 tokenId) public override whenNotPaused {
-        require(from != address(0) && to != address(0), "Invalid address");
+    function autoRenew(uint256 tokenId) external whenNotPaused {
+        require(autoRenewEnabled, "Auto renew disabled");
         
         DepositPosition storage position = positions[tokenId];
+        require(position.active, "Position not active");
+        require(block.timestamp >= position.maturityAt + 3 days, "Too early to auto renew");
+
+        uint256 newApr = position.aprSnapshot * 90 / 100;
+        if (newApr < position.aprFloor) {
+            newApr = position.aprFloor;
+        }
+        position.aprSnapshot = newApr;
+        position.maturityAt = block.timestamp + plans[position.planId].tenorDays * 86400;
+        position.startTime = block.timestamp;
+        position.renewCount += 1;
+
+        emit AutoRenewed(ownerOf(tokenId), tokenId, newApr, position.maturityAt, position.renewCount);
+    }
+
+    function manualRenew(uint256 tokenId, uint256 newPlanId) external whenNotPaused nonReentrant {
+        DepositPosition storage position = positions[tokenId];
+        
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
+        require(position.active, "Position not active");
+        require(block.timestamp >= position.maturityAt, "Not yet matured");
+        require(newPlanId > 0 && newPlanId < nextPlanId, "Plan does not exist");
+        require(plans[newPlanId].enabled, "Plan not enabled");
+
+        uint256 bonus = position.principal * 50 / 10000;
+        IVaultManager(vaultManager).payRenewBonus(msg.sender, bonus);
+
+        SavingsPlan memory newPlan = plans[newPlanId];
+        uint256 newAprFloor = newPlan.aprBps * 50 / 10000;
+
+        position.aprSnapshot = newPlan.aprBps;
+        position.maturityAt = block.timestamp + newPlan.tenorDays * 86400;
+        position.startTime = block.timestamp;
+        position.planId = newPlanId;
+        position.penaltySnapshot = newPlan.earlyWithdrawPenaltyBps;
+        position.aprFloor = newAprFloor;
+        position.renewCount = 0;
+
+        emit ManualRenewed(msg.sender, tokenId, newPlanId, newPlan.aprBps, position.maturityAt, bonus);
+    }
+
+function transferFrom(address from, address to, uint256 tokenId) public override whenNotPaused nonReentrant {
+        require(to != address(0), "Invalid address");
+        require(_ownerOf(tokenId) != address(0), "Token does not exist");
+        
+        DepositPosition storage position = positions[tokenId];
+        require(ownerOf(tokenId) == msg.sender, "Not owner");
         require(position.active, "Position not active");
 
         uint256 transferFee = (position.principal * TRANSFER_FEE_BPS) / BPS_DIVISOR;
         uint256 newPrincipal = position.principal - transferFee;
 
-        position.owner = to;
         position.principal = newPrincipal;
 
         IVaultManager(vaultManager).transferPenalty(transferFee);
 
         super.transferFrom(from, to, tokenId);
     }
-
+    // Interest = Principal * (APR / 100) * (Tenor in years)
     function calculateInterest(uint256 principal, uint256 aprBps, uint256 tenorSeconds) public pure returns (uint256) {
         return (principal * aprBps * tenorSeconds) / (SECONDS_PER_YEAR * BPS_DIVISOR);
     }
-
+    // View functions for frontend
     function getPosition(uint256 tokenId) external view returns (DepositPosition memory) {
         return positions[tokenId];
     }
-
+    // View function to get plan details
     function getPlan(uint256 planId) external view returns (SavingsPlan memory) {
         return plans[planId];
     }
-
+    // View function to get next token ID (for frontend tracking)
     function getNextPlanId() external view returns (uint256) {
         return nextPlanId;
     }
 }
 
 interface IVaultManager {
+    function receiveDeposit(uint256 amount) external;
     function setFeeReceiver(address _feeReceiver) external;
     function withdrawToUser(address user, uint256 principal, uint256 interest) external;
     function transferPenalty(uint256 amount) external;
+    function payRenewBonus(address user, uint256 amount) external;
 }

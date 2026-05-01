@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "github": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "GitHub Models",
+      "options": {
+        "baseURL": "https://models.github.ai/inference",
+        "apiKey": "{env:GITHUB_TOKEN}"
+      }
+    },
+    "openai": {
+      "options": {
+        "apiKey": "{env:OPENAI_API_KEY}"
+      }
+    },
+    "anthropic": {
+      "options": {
+        "apiKey": "{env:ANTHROPIC_API_KEY}"
+      }
+    }
+  }
+}
